@@ -1,0 +1,10 @@
+# Convexification mode: inverse_log
+
+Experimental fluxes:
+0.027917 0.000017 0.216565 -0.358536 0.036094 0.142477
+
+Predicted fluxes:
+0.030282 -0.000006 0.225165 -0.349327 0.040177 0.144372
+
+Optimized coefficients:
+0.446337 0.066880 0.480873 0.299728 0.866740 0.276444

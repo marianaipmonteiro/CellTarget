@@ -183,7 +183,127 @@ def solve_forward_pass(C: torch.Tensor, fba_layer: CvxpyLayer):
     print('Predicted fluxes:', predicted_fluxes)
 
 
-def check_kkt_conditions(C: torch.Tensor, case: FullObservabilityCase, mode):
+
+
+def check_kkt_conditions(C: torch.Tensor, case: FullObservabilityCase, mode: str):
+    import numpy as np, cvxpy as cp
+
+    # --- Pull to numpy
+    C_np = C.detach().cpu().numpy().astype(float)
+    S_np = case.S.detach().cpu().numpy().astype(float) if torch.is_tensor(case.S) else np.asarray(case.S, float)
+    vmin = case.v_min.detach().cpu().numpy().astype(float) if torch.is_tensor(case.v_min) else np.asarray(case.v_min, float)
+    vmax = case.v_max.detach().cpu().numpy().astype(float) if torch.is_tensor(case.v_max) else np.asarray(case.v_max, float)
+    n = case.num_fluxes
+    eps = 1e-6
+
+    # --- Rebuild problem in <= form (to get clean dual signs)
+    v = cp.Variable(n)
+    Cpar = cp.Parameter(n)
+    z = cp.multiply(Cpar, v)
+
+    if mode == "norm":
+        obj = cp.Minimize(cp.norm(z, 2) + eps)
+        sgn = +1
+    elif mode == "sum_squares":
+        obj = cp.Minimize(cp.sum_squares(z))
+        sgn = +1
+    elif mode == "logsumexp":
+        obj = cp.Minimize(cp.log_sum_exp(z))
+        sgn = +1
+    elif mode == "linear":
+        obj = cp.Maximize(cp.sum(z))
+        sgn = -1
+    elif mode == "inverse_log":
+        obj = cp.Maximize(cp.log(cp.sum(z) + eps))
+        sgn = -1
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    cons = [
+        S_np @ v == 0,
+        v - vmax <= 0,       # λ_upper ≥ 0
+        vmin - v <= 0        # λ_lower ≥ 0
+    ]
+    prob = cp.Problem(obj, cons)
+    Cpar.value = C_np
+    prob.solve(solver=cp.SCS, verbose=False)
+
+    v_sol = v.value
+    if v_sol is None:
+        return {"error": "solver_failed"}
+
+    mu        = np.asarray(cons[0].dual_value, float).ravel()
+    lam_upper = np.asarray(cons[1].dual_value, float).ravel()   # ≥ 0
+    lam_lower = np.asarray(cons[2].dual_value, float).ravel()   # ≥ 0
+
+    # --- Primal feasibility
+    eq_res = np.linalg.norm(S_np @ v_sol)
+    #bounds_ok = np.all(v_sol <= vmax + 1e-9) and np.all(v_sol >= vmin - 1e-9)
+    def bounds_ok_with_tol(v, vmin, vmax, tol=1e-7):
+        upper_viol = np.max(v - vmax)
+        lower_viol = np.max(vmin - v)
+        ok = (upper_viol <= tol) and (lower_viol <= tol)
+        return ok, float(max(upper_viol, 0.0)), float(max(lower_viol, 0.0))
+
+    bounds_ok, up_violation, low_violation = bounds_ok_with_tol(v_sol, vmin, vmax, tol=1e-7)
+
+    # --- Gradient wrt v (mode-specific)
+    z_np = C_np * v_sol
+    if mode == "norm":
+        nz = np.linalg.norm(z_np)
+        if nz > 0:
+            grad_f = (C_np**2) * v_sol / nz
+            grad_defined = True
+        else:
+            grad_f = np.zeros_like(v_sol)  # subgradient set-valued
+            grad_defined = False
+    elif mode == "sum_squares":
+        grad_f = 2.0 * (C_np**2) * v_sol
+        grad_defined = True
+    elif mode == "logsumexp":
+        # softmax(z)
+        m = np.max(z_np)
+        sm = np.exp(z_np - m)
+        sm /= np.sum(sm)
+        grad_f = sm * C_np
+        grad_defined = True
+    elif mode == "linear":
+        grad_f = C_np
+        grad_defined = True
+    elif mode == "inverse_log":
+        s = np.sum(z_np) + eps
+        if s <= 0:
+            return {"error": "domain_error_inverse_log", "sum_Cv": float(s - eps)}
+        grad_f = C_np / s
+        grad_defined = True
+
+    # --- Stationarity:  sgn*∇f + S^T μ + λ_upper − λ_lower = 0
+    stationarity_vec = sgn * grad_f + S_np.T @ mu + lam_upper - lam_lower
+    stationarity_res = np.linalg.norm(stationarity_vec)
+
+    # --- Complementary slackness
+    comp_upper = np.max(np.abs(lam_upper * (v_sol - vmax)))
+    comp_lower = np.max(np.abs(lam_lower * (vmin - v_sol)))
+
+    return {
+        "primal_feasibility": float(eq_res),
+        "bounds_feasible": bool(bounds_ok),
+        "max_upper_violation": up_violation,
+        "max_lower_violation": low_violation,
+        "stationarity_residual": float(stationarity_res),
+        "comp_upper": float(comp_upper),
+        "comp_lower": float(comp_lower),
+        "grad_defined": bool(grad_defined),
+        "objective_value": float(prob.value),
+        "duals_norms": {
+            "mu": float(np.linalg.norm(mu)),
+            "lam_upper": float(np.linalg.norm(lam_upper)),
+            "lam_lower": float(np.linalg.norm(lam_lower)),
+        }
+    }
+
+
+def old_check_kkt_conditions(C: torch.Tensor, case: FullObservabilityCase, mode):
     C_numpy = C.detach().cpu().numpy()
     S_np = case.S.detach().cpu().numpy() if torch.is_tensor(case.S) else case.S
 
@@ -244,13 +364,73 @@ def check_kkt_conditions(C: torch.Tensor, case: FullObservabilityCase, mode):
     }
 
 
-def interpret_kkt(residuals, tol=1e-5):
-    print("🔍 KKT Summary:")
-    print("   ✅ Primal feasibility:", residuals["primal_feasibility"] < tol)
-    print("   ✅ Bounds feasible:", residuals["bounds_feasible"])
-    print("   ✅ Stationarity OK:", residuals["stationarity_residual"] < tol)
-    print("   ✅ Slack min OK:", residuals["comp_slack_min"] < tol)
-    print("   ✅ Slack max OK:", residuals["comp_slack_max"] < tol)
+def interpret_kkt(
+    residuals: dict,
+    tol_primal: float = 1e-7,
+    tol_bounds: float = 1e-7,
+    tol_stat_abs: float = 1e-5,
+    tol_stat_rel: float = 1e-6,
+    tol_comp: float = 1e-6,
+):
+    if residuals is None:
+        print("❌ No KKT data.")
+        return
+
+    if "error" in residuals:
+        print(f"❌ KKT check aborted: {residuals['error']}")
+        if "sum_Cv" in residuals:
+            print(f"   sum(C⊙v): {residuals['sum_Cv']:.3e}")
+        return
+
+    # Backward compatibility for key names
+    comp_lower = float(residuals.get("comp_lower",
+                      residuals.get("comp_slack_min", float("inf"))))
+    comp_upper = float(residuals.get("comp_upper",
+                      residuals.get("comp_slack_max", float("inf"))))
+    stat_res   = float(residuals.get("stationarity_residual", float("inf")))
+    prim_res   = float(residuals.get("primal_feasibility", float("inf")))
+    bounds_ok  = bool(residuals.get("bounds_feasible", False))
+    grad_def   = bool(residuals.get("grad_defined", True))
+
+    max_up_viol  = float(residuals.get("max_upper_violation", 0.0))
+    max_low_viol = float(residuals.get("max_lower_violation", 0.0))
+
+    # Optional relative stationarity gate
+    obj_val = float(residuals.get("objective_value", 0.0))
+    scale = 1.0 + abs(obj_val)  # simple scale proxy; use ||grad|| if pass it through residuals
+    stat_ok = (stat_res < tol_stat_abs) or ((stat_res / scale) < tol_stat_rel)
+
+    print("🔍 KKT Summary")
+    print(f"   ‣ Primal equality ‖S v‖:         {prim_res:.3e}   → {'OK' if prim_res < tol_primal else 'FAIL'}")
+    print(f"   ‣ Bounds feasible:                {bounds_ok} "
+          f"(max↑viol={max_up_viol:.3e}, max↓viol={max_low_viol:.3e})")
+    print(f"   ‣ Stationarity ‖∇L‖:             {stat_res:.3e}   "
+          f"→ {'OK' if stat_ok else 'FAIL'} "
+          f"[abs<{tol_stat_abs:.1e} or rel<{tol_stat_rel:.1e}]")
+    print(f"   ‣ Complementarity (lower):        {comp_lower:.3e} → {'OK' if comp_lower < tol_comp else 'FAIL'}")
+    print(f"   ‣ Complementarity (upper):        {comp_upper:.3e} → {'OK' if comp_upper < tol_comp else 'FAIL'}")
+
+    if not grad_def:
+        print("⚠️  Gradient undefined (subgradient case, e.g. ‖diag(C)v‖ = 0). "
+              "Stationarity pass/fail may be inconclusive.")
+
+    if "objective_value" in residuals:
+        print(f"   ‣ Objective value:                {obj_val:.6g}")
+
+    if "duals_norms" in residuals:
+        dn = residuals["duals_norms"]
+        mu_n   = float(dn.get("mu", float("nan")))
+        up_n   = float(dn.get("lam_upper", float("nan")))
+        low_n  = float(dn.get("lam_lower", float("nan")))
+        print(f"   ‣ ‖μ‖: {mu_n:.3e} | ‖λ_upper‖: {up_n:.3e} | ‖λ_lower‖: {low_n:.3e}")
+
+    all_ok = (
+        (prim_res < tol_primal) and
+        bounds_ok and (max_up_viol <= tol_bounds) and (max_low_viol <= tol_bounds) and
+        stat_ok and
+        (comp_lower < tol_comp) and (comp_upper < tol_comp)
+    )
+    print(f"\n✅ Overall KKT satisfied: {all_ok}")
 
 
 def original_single_start(case, optimal_fluxes, run_id, mode):
@@ -277,24 +457,27 @@ def single_start(case, optimal_fluxes, run_id, mode, lr, num_epochs):
         loss_history, _ = main(C_tensor, fba_layer, experimental_fluxes_tensor, lr=lr, num_epochs=15, optim_option='LBFGS')
         return torch.tensor([loss_history[-1]])
 
-    # 🔢 Bounds: [number of measured flux indices + 1]
-    # if regularization +1
-    dim = len(optimal_fluxes)
+    # # 🔢 Bounds: [number of measured flux indices + 1]
+    # # if regularization +1
+    # dim = len(optimal_fluxes)
+    #
+    # lower_bound = torch.zeros(dim)
+    # upper_bound = torch.ones(dim)
+    #
+    # # 🔍 Bayesian optimization to find a good initial C
+    # best_candidate = bayesian_optimization(
+    #     f=f,
+    #     lower_bound=lower_bound,
+    #     upper_bound=upper_bound,
+    #     num_initial_points=10,
+    #     num_iterations=1  # Increase for deeper search
+    # )
+    #
+    # # 🎯 Use best_candidate as C
+    # C = best_candidate.clone().detach().requires_grad_(True)
 
-    lower_bound = torch.zeros(dim)
-    upper_bound = torch.ones(dim)
-
-    # 🔍 Bayesian optimization to find a good initial C
-    best_candidate = bayesian_optimization(
-        f=f,
-        lower_bound=lower_bound,
-        upper_bound=upper_bound,
-        num_initial_points=10,
-        num_iterations=1  # Increase if you want deeper search
-    )
-
-    # 🎯 Use best_candidate as C
-    C = best_candidate.clone().detach().requires_grad_(True)
+    # randomly start between 0 and 1
+    C = torch.rand(len(optimal_fluxes), dtype=torch.float32, requires_grad=True)
 
     # 🔁 Now do the full optimization
     fba_layer = setup_optimization_with_basis_functions(case, mode)
@@ -355,7 +538,7 @@ def plot_summary(C: torch.Tensor, predicted_fluxes: torch.Tensor, true_fluxes: t
 
 
 def save_flux_and_coefficients(C: torch.Tensor, predicted_fluxes: torch.Tensor, true_fluxes: torch.Tensor, mode: str):
-    output_dir = os.path.join("Publication_Results", "full_obs", mode)
+    output_dir = os.path.join("ThesisResults", "full_obs", mode)
     os.makedirs(output_dir, exist_ok=True)
 
     coeffs = C.detach().cpu().numpy().flatten()
@@ -377,29 +560,81 @@ def save_flux_and_coefficients(C: torch.Tensor, predicted_fluxes: torch.Tensor, 
 import csv
 
 def init_kkt_csv():
-    csv_path = os.path.join("Publication_Results", "full_obs", "kkt_summary.csv")
+    csv_path = os.path.join("ThesisResults", "full_obs", "kkt_summary.csv")
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["mode", "primal_feasibility", "bounds_feasible",
                          "stationarity_residual", "comp_slack_min", "comp_slack_max"])
 
-def append_kkt_csv(residuals: dict, mode: str, output_dir):
+import os, csv, math
+from datetime import datetime
+
+def append_kkt_csv(residuals: dict, mode: str, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "kkt_summary.csv")
+
+    # Back-compat & safe gets
+    prim   = float(residuals.get("primal_feasibility", math.nan))
+    b_ok   = bool(residuals.get("bounds_feasible", False))
+    stat   = float(residuals.get("stationarity_residual", math.nan))
+    comp_l = float(residuals.get("comp_lower", residuals.get("comp_slack_min", math.nan)))
+    comp_u = float(residuals.get("comp_upper", residuals.get("comp_slack_max", math.nan)))
+    up_vio = float(residuals.get("max_upper_violation", math.nan))
+    lo_vio = float(residuals.get("max_lower_violation", math.nan))
+    obj    = float(residuals.get("objective_value", math.nan))
+    gd     = bool(residuals.get("grad_defined", True))
+
+    dn = residuals.get("duals_norms", {}) or {}
+    mu_n  = float(dn.get("mu", math.nan))
+    lup_n = float(dn.get("lam_upper", math.nan))
+    llo_n = float(dn.get("lam_lower", math.nan))
+
+    row = [
+        datetime.utcnow().isoformat(),  # timestamp (optional but handy)
+        mode,
+        f"{prim:.6e}",
+        int(b_ok),
+        f"{up_vio:.6e}",
+        f"{lo_vio:.6e}",
+        f"{stat:.6e}",
+        f"{comp_l:.6e}",
+        f"{comp_u:.6e}",
+        f"{obj:.6e}",
+        f"{mu_n:.6e}",
+        f"{lup_n:.6e}",
+        f"{llo_n:.6e}",
+        int(gd),
+    ]
+
+    header = [
+        "timestamp_utc",
+        "mode",
+        "primal_feasibility",
+        "bounds_feasible",
+        "max_upper_violation",
+        "max_lower_violation",
+        "stationarity_residual",
+        "comp_lower",
+        "comp_upper",
+        "objective_value",
+        "norm_mu",
+        "norm_lambda_upper",
+        "norm_lambda_lower",
+        "grad_defined",
+    ]
+
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
     with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            mode,
-            f"{residuals['primal_feasibility']:.6e}",
-            int(residuals['bounds_feasible']),
-            f"{residuals['stationarity_residual']:.6e}",
-            f"{residuals['comp_slack_min']:.6e}",
-            f"{residuals['comp_slack_max']:.6e}",
-        ])
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        w.writerow(row)
+
 
 def plot_loss_history(loss_history: list, mode: str):
     import os
-    output_dir = os.path.join("Publication_Results", "full_obs", mode)
+    output_dir = os.path.join("ThesisResults", "full_obs", mode)
     os.makedirs(output_dir, exist_ok=True)
 
     plt.figure(figsize=(7, 5))
@@ -426,6 +661,15 @@ if __name__ == '__main__':
         ])
     )
 
+    # geometric_fba= FullObservabilityCase(
+    #     num_fluxes=5,
+    #     v_min=[-1, 0, 0, 0, 0],
+    #     v_max=[1, 2, 2, 10000, 10000],
+    #     S=np.array([
+    #         [1, 0, 0, 0, 0],
+    #         [0, 1, 1, 1, -1],
+    #     ])
+    # )
 
     optimal_fluxes = setup_ground_truth(geometric_fba)
 
@@ -434,14 +678,14 @@ if __name__ == '__main__':
     for mode in ["logsumexp","norm","sum_squares"]:
         print(f"\n🔍 Convexification: {mode.upper()}")
         try:
-            best_C, fba_layer, loss_history  = multi_start_inverse_fba_parallel(geometric_fba, optimal_fluxes, num_starts=5, mode=mode, lr=1e-3, num_epochs=200)
+            best_C, fba_layer, loss_history  = multi_start_inverse_fba_parallel(geometric_fba, optimal_fluxes, num_starts=1, mode=mode, lr=1e-3, num_epochs=50)
             predicted_fluxes, = fba_layer(best_C)
             measured_fluxes = torch.tensor(optimal_fluxes, dtype=torch.float32)
             loss = torch.nn.functional.mse_loss(predicted_fluxes, torch.tensor(optimal_fluxes, dtype=torch.float32)).item()
             print(f"Loss: {loss:.4f}")
 
             # Save loss history to txt
-            output_dir = os.path.join("Publication_Results", "full_obs", mode)
+            output_dir = os.path.join("ThesisResults_V6", "full_obs_random_SCS", mode)
             os.makedirs(output_dir, exist_ok=True)
 
             with open(os.path.join(output_dir, "loss_history.txt"), "w") as f:
@@ -471,10 +715,10 @@ if __name__ == '__main__':
             plot_summary(best_C, predicted_fluxes, torch.tensor(optimal_fluxes, dtype=torch.float32), mode, output_dir)
 
             residuals = check_kkt_conditions(best_C, geometric_fba, mode)
-            print("✅ Final KKT residuals:", residuals)
+            print(" Final KKT residuals:", residuals)
             interpret_kkt(residuals)
             append_kkt_csv(residuals, mode, output_dir)
         except Exception as e:
-            print(f"❌ Mode {mode.upper()} failed with error: {e}")
+            print(f" Mode {mode.upper()} failed with error: {e}")
             continue
 

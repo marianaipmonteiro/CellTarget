@@ -1,0 +1,2 @@
+timestamp_utc,mode,primal_feasibility,bounds_feasible,max_upper_violation,max_lower_violation,stationarity_residual,comp_lower,comp_upper,objective_value,norm_mu,norm_lambda_upper,norm_lambda_lower,grad_defined
+2025-08-14T16:34:18.144157,norm,1.699075e-13,1,0.000000e+00,0.000000e+00,8.620771e-07,1.941848e-11,2.041026e-11,4.398607e-01,1.156592e-01,2.199298e-01,1.156591e-01,1

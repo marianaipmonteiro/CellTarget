@@ -1,10 +1,12 @@
+from __future__ import annotations
 import argparse
 import logging
 import os
-from typing import List, Tuple, Callable, Sequence, Dict, Any
+from typing import List, Tuple, Callable, Sequence, Dict, Any, Set
 import cvxpylayers
 import pandas as pd
 import cobra
+from cobra import Model
 from cobra.io import load_json_model
 import numpy as np
 import cvxpy as cp
@@ -19,7 +21,7 @@ from functools import partial
 from bo import bayesian_optimization
 from setup import PartialObservabilityCase
 import csv
-
+import torch
 
 
 
@@ -35,19 +37,19 @@ def plot_grad_per_dimension(grad_dir_history: torch.Tensor, mode: str, labels, o
     G = grad_dir_history.cpu().numpy()
     T, m = G.shape
 
-    plt.figure(figsize=(7,4))
-    for j in range(m):
-        name = labels[j] if labels is not None and j < len(labels) else f"dir {j}"
-        plt.plot(G[:, j], label=name, linewidth=1.5)
-    if logy:
-        plt.yscale("log")
-    plt.xlabel("Epoch")
-    plt.ylabel("|| gradient contribution ||")
-    plt.title(f"Per-dimension gradient magnitude ({mode})")
-    plt.legend(ncol=2, fontsize=8)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"grad_per_dimension_{mode}.png"), dpi=200)
-    plt.close()
+    # plt.figure(figsize=(7,4))
+    # for j in range(m):
+    #     name = labels[j] if labels is not None and j < len(labels) else f"dir {j}"
+    #     plt.plot(G[:, j], label=name, linewidth=1.5)
+    # if logy:
+    #     plt.yscale("log")
+    # plt.xlabel("Epoch")
+    # plt.ylabel("|| gradient contribution ||")
+    # plt.title(f"Per-dimension gradient magnitude ({mode})")
+    # plt.legend(ncol=2, fontsize=8)
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(output_dir, f"grad_per_dimension_{mode}.png"), dpi=200)
+    # plt.close()
 
     # print loss per dimension to a csv
     with open(os.path.join(output_dir, f"grad_per_dimension_{mode}.csv"), "w", newline='') as csvfile:
@@ -60,16 +62,16 @@ def plot_grad_per_dimension(grad_dir_history: torch.Tensor, mode: str, labels, o
 def plot_loss_history(loss_history: list, mode: str,  output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
 
-    plt.figure(figsize=(7, 5))
-    plt.plot(loss_history, label='Loss')
-    plt.yscale('log')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss (log scale)')
-    plt.title(f'Loss History ({mode})')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"loss_history_{mode}.pdf"), format='pdf')
-    plt.close()
+    # plt.figure(figsize=(7, 5))
+    # plt.plot(loss_history, label='Loss')
+    # plt.yscale('log')
+    # plt.xlabel('Epoch')
+    # plt.ylabel('Loss (log scale)')
+    # plt.title(f'Loss History ({mode})')
+    # plt.grid(True, linestyle='--', alpha=0.6)
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(output_dir, f"loss_history_{mode}.pdf"), format='pdf')
+    # plt.close()
 
     # print loss history to a csv
     with open(os.path.join(output_dir, f"loss_history_{mode}.csv"), "w", newline='') as csvfile:
@@ -139,102 +141,338 @@ def save_flux_and_coefficients(C: torch.Tensor, predicted_fluxes: torch.Tensor, 
         f.write(" ".join([f"{x:.6f}" for x in coeffs]) + "\n")
 
 
+def _filter_finite_measured_indices(
+    experimental_fluxes_tensor: torch.Tensor,  # shape: (n,)
+    measured_flux_indices: Sequence[int],
+) -> List[int]:
+    idx_all: torch.Tensor = torch.tensor(list(measured_flux_indices), device=experimental_fluxes_tensor.device)
+    y_all: torch.Tensor = experimental_fluxes_tensor[idx_all]
+    keep: torch.Tensor = torch.isfinite(y_all)
+    return [int(i) for i in idx_all[keep].tolist()]
 
 
-def optimize_C_partial_lbfgs(
-    C: torch.Tensor,                                          # (in) shape: [k], dtype: float32
+def original_optimize_C_partial_lbfgs(
+    C: torch.Tensor,                                          # (in) shape: [k], dtype: float32/float64
     fba_layer: Callable[[torch.Tensor], Tuple[torch.Tensor]], # (in) maps C -> (predicted_fluxes,)
-    experimental_fluxes_tensor: torch.Tensor,                 # (in) shape: [n], dtype: float32
+    experimental_fluxes_tensor: torch.Tensor,                 # (in) shape: [n], dtype: float32/float64
     measured_flux_indices: Sequence[int],                     # (in) indices into flux vector
-    lr: float,                                                # (in) LBFGS step size (often ~1.0)
-    num_epochs: int,                                          # (in) outer iterations (LBFGS steps)
-    lambda_reg: float,                                        # (in) L2 weight on C
-) -> Tuple[List[float], torch.Tensor, dict]:                        # (out) (loss_history, optimized C)
-    C = torch.nn.Parameter(C.detach().clone(), requires_grad=True)
+    lr: float,                                                # (in) LBFGS step size
+    num_epochs: int,                                          # (in) outer iterations
+    lambda_reg: float,                                        # (in) L2 weight on C (applied to clamped C)
+) -> Tuple[List[float], torch.Tensor, Dict[str, Any]]:
+    """
+    LBFGS with *soft clamping* C in (0,1) via sigmoid reparameterization.
+
+    Inputs/outputs match the original function signature:
+      - Input: initial C (used only to initialize an internal unconstrained theta)
+      - Output: best_C returned in (0,1), plus loss_history and extras
+    """
+
+    device: torch.device = C.device
+    dtype: torch.dtype = C.dtype
+
+    # ---- helpers ----
+    def _assert_finite(x: torch.Tensor, name: str) -> None:
+        if not torch.isfinite(x).all():
+            raise FloatingPointError(f"{name} contains non-finite values.")
+
+    def _theta_to_C(theta: torch.Tensor) -> torch.Tensor:
+        eps: float = 1e-6
+        theta_safe: torch.Tensor = torch.nan_to_num(theta, nan=0.0, posinf=20.0, neginf=-20.0)
+        C01: torch.Tensor = torch.sigmoid(theta_safe)
+        return torch.clamp(C01, eps, 1.0 - eps)
+
+    def _safe_forward(C01: torch.Tensor) -> torch.Tensor:
+        _assert_finite(C01, "C")
+        (pred,) = fba_layer(C01)
+        _assert_finite(pred, "predicted_fluxes")
+        return pred
+
+    # ---- initialize theta from input C (logit) ----
+    eps0: float = 1e-6
+    C0: torch.Tensor = torch.clamp(C.detach().clone(), eps0, 1.0 - eps0)
+    theta0: torch.Tensor = torch.log(C0 / (1.0 - C0))  # logit
+
+    theta: torch.nn.Parameter = torch.nn.Parameter(theta0, requires_grad=True)
 
     optimizer = torch.optim.LBFGS(
-        [C],
+        [theta],
         lr=lr,
-        max_iter=20,              # per-step inner iters (tweak)
-        max_eval=25,              # evaluations cap (tweak)
+        max_iter=10,
+        max_eval=25,
         tolerance_grad=1e-9,
         tolerance_change=1e-9,
         history_size=100,
         line_search_fn="strong_wolfe",
     )
 
-    flux_subset = experimental_fluxes_tensor[measured_flux_indices]
-    loss_history: List[float] = []
-    grad_dir_history: List[List[float]] = []  # will be [T, m]
+    idx: List[int] = _filter_finite_measured_indices(experimental_fluxes_tensor, measured_flux_indices)
+    flux_subset: torch.Tensor = experimental_fluxes_tensor[idx]
+    m: int = len(idx)
 
-    # pure eval (no backward) to measure loss at current C
+    if m == 0:
+        raise ValueError("All measured targets are NaN/Inf after filtering; cannot optimize.")
+
+    loss_history: List[float] = []
+    grad_dir_history: List[List[float]] = []  # [T, m]
+
     @torch.no_grad()
     def eval_loss_only() -> float:
-        (pred,) = fba_layer(C)
-        pred_sub = pred[measured_flux_indices]
-        loss_mse = torch.nn.functional.mse_loss(pred_sub, flux_subset)
-        loss = loss_mse + lambda_reg * torch.sum(C ** 2)
-        return float(loss)
+        C01: torch.Tensor = _theta_to_C(theta)
+        pred: torch.Tensor = _safe_forward(C01)
+        pred_sub: torch.Tensor = pred[idx]
+        loss_mse: torch.Tensor = torch.nn.functional.mse_loss(pred_sub, flux_subset)
+        loss: torch.Tensor = loss_mse + lambda_reg * torch.sum(C01 ** 2)
+        return float(loss.detach().cpu().item())
 
-    # init best trackers (at starting C)
-    best_loss = eval_loss_only()
-    best_C = C.detach().clone()
+    best_loss: float = eval_loss_only()
+    best_C: torch.Tensor = _theta_to_C(theta).detach().clone()
 
     def closure() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
-        (predicted_fluxes,) = fba_layer(C)
-        predicted_subset = predicted_fluxes[measured_flux_indices]
-        loss = torch.nn.functional.mse_loss(predicted_subset, flux_subset)
-        loss = loss + lambda_reg * torch.sum(C ** 2)
-        loss.backward()
-        return loss
+        try:
+            C01: torch.Tensor = _theta_to_C(theta)
+            pred: torch.Tensor = _safe_forward(C01)
+            pred_sub: torch.Tensor = pred[idx]
+            loss: torch.Tensor = torch.nn.functional.mse_loss(pred_sub, flux_subset)
+            loss = loss + lambda_reg * torch.sum(C01 ** 2)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("loss is non-finite")
+            loss.backward()
+            return loss
+        except Exception:
+            # Always-finite penalty in theta-space (so LBFGS can step away even if theta is corrupted)
+            theta_safe: torch.Tensor = torch.nan_to_num(theta, nan=0.0, posinf=0.0, neginf=0.0)
+            penalty: torch.Tensor = 1.0 + 1e-6 * torch.sum(theta_safe ** 2)
+            penalty.backward()
+            return penalty
 
-    m = len(measured_flux_indices)
+    m: int = len(idx)
 
     for _ in range(num_epochs):
-        # ----  compute per-dimension gradient contributions (MSE part) ----
+        # ---- per-dimension gradient contributions in C-space (diagnostic) ----
         optimizer.zero_grad(set_to_none=True)
-        (predicted_fluxes,) = fba_layer(C)
-        predicted_subset = predicted_fluxes[measured_flux_indices]
-        residual = predicted_subset - flux_subset  # [m]
+        C01_diag: torch.Tensor = _theta_to_C(theta)
 
-        per_dim_norms = []
-        for i in range(m):
-            unit = torch.zeros_like(predicted_subset)
-            unit[i] = 1.0
-            # dpred_i/dC
-            Ji = torch.autograd.grad(
-                outputs=predicted_subset,
-                inputs=C,
-                grad_outputs=unit,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=False
-            )[0]  # [k]
-            # Gradient contribution of dimension i to d/dC (MSE term):
-            # (2/m)*r_i * dpred_i/dC
-            gi = (2.0 / m) * residual[i] * Ji
-            per_dim_norms.append(gi.norm().item())
+        try:
+            pred_diag: torch.Tensor = _safe_forward(C01_diag)
+            pred_sub_diag: torch.Tensor = pred_diag[idx]
+            residual: torch.Tensor = pred_sub_diag - flux_subset  # [m]
 
-        grad_dir_history.append(per_dim_norms)
+            per_dim_norms: List[float] = []
+            for i in range(m):
+                unit: torch.Tensor = torch.zeros_like(pred_sub_diag)
+                unit[i] = 1.0
+
+                # dpred_i/dC (C-space sensitivity at the current clamped C)
+                Ji: torch.Tensor = torch.autograd.grad(
+                    outputs=pred_sub_diag,
+                    inputs=C01_diag,
+                    grad_outputs=unit,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]  # [k]
+
+                gi: torch.Tensor = (2.0 / float(m)) * residual[i] * Ji
+                per_dim_norms.append(float(gi.norm().detach().cpu().item()))
+
+            grad_dir_history.append(per_dim_norms)
+        except Exception:
+            # If the layer fails here, still keep array shapes consistent.
+            grad_dir_history.append([float("nan")] * m)
         # ---------------------------------------------------------------------
 
-        loss_val = closure()
-        grad_norm = C.grad.norm().item() if C.grad is not None else float("nan")
-        optimizer.step(closure)   # may call closure multiple times internally
+        optimizer.step(closure)
 
-        # Record post-step loss (actual new parameters)
-        post_step_loss = eval_loss_only()
+        post_step_loss: float = eval_loss_only()
         loss_history.append(post_step_loss)
+
         if post_step_loss < best_loss:
             best_loss = post_step_loss
-            best_C = C.detach().clone()
-        print(f"Loss: {loss_history[-1]:.6e} | ∇C: {grad_norm:.3e}")
+            best_C = _theta_to_C(theta).detach().clone()
 
-    extras = {
-        "grad_dir_history": torch.tensor(grad_dir_history)  # [T, m]
+        # Report gradient norm in theta-space (the variable being optimized)
+        grad_norm: float = (
+            float(theta.grad.norm().detach().cpu().item()) if theta.grad is not None else float("nan")
+        )
+        print(f"Loss: {loss_history[-1]:.6e} | ∇θ: {grad_norm:.3e}")
+
+    extras: Dict[str, Any] = {
+        "grad_dir_history": torch.tensor(grad_dir_history, device="cpu"),
+        "best_loss": best_loss,
     }
-    return loss_history, best_C , extras
+    return loss_history, best_C, extras
+
+
+def optimize_C_partial_lbfgs(
+    C: torch.Tensor,  # (in) shape: [k], dtype: float32/float64
+    fba_layer: Callable[[torch.Tensor], Tuple[torch.Tensor]],  # (in) maps C -> (predicted_fluxes,)
+    experimental_fluxes_tensor: torch.Tensor,  # (in) shape: [n], dtype: float32/float64
+    measured_flux_indices: Sequence[int],  # (in) indices into flux vector
+    lr: float,  # (in) LBFGS step size
+    num_epochs: int,  # (in) outer iterations
+    lambda_reg: float,  # (in) L2 weight on C (applied to simplex C)
+) -> Tuple[List[float], torch.Tensor, Dict[str, Any]]:
+    """
+    LBFGS with simplex constraint: C = softmax(theta), so sum(C)=1 and C_i>0.
+
+    """
+
+    device: torch.device = C.device
+    dtype: torch.dtype = C.dtype
+
+    # ------------------------ helpers ------------------------
+    def _assert_finite(x: torch.Tensor, name: str) -> None:
+        if not torch.isfinite(x).all():
+            raise FloatingPointError(f"{name} contains non-finite values.")
+
+    def _filter_finite_measured_indices(
+        y: torch.Tensor, indices: Sequence[int]
+    ) -> List[int]:
+        idx_out: List[int] = []
+        for j in indices:
+            if 0 <= int(j) < int(y.numel()):
+                v: torch.Tensor = y[int(j)]
+                if torch.isfinite(v):
+                    idx_out.append(int(j))
+        return idx_out
+
+    def _theta_to_C(theta: torch.Tensor) -> torch.Tensor:
+        theta_safe: torch.Tensor = torch.nan_to_num(
+            theta, nan=0.0, posinf=20.0, neginf=-20.0
+        )
+        C_simplex: torch.Tensor = torch.softmax(theta_safe, dim=0)  # sum=1
+        return C_simplex
+
+    def _safe_forward(C_simplex: torch.Tensor) -> torch.Tensor:
+        _assert_finite(C_simplex, "C")
+        (pred,) = fba_layer(C_simplex)
+        _assert_finite(pred, "predicted_fluxes")
+        return pred
+
+    # ------------------- initialize theta --------------------
+    eps0: float = 1e-12
+    C0: torch.Tensor = torch.clamp(C.detach().clone(), min=eps0)
+    if float(C0.sum().detach().cpu().item()) <= 0.0:
+        # fallback to uniform init if user passes all-zeros
+        k: int = int(C0.numel())
+        C0 = torch.full((k,), 1.0 / float(k), device=device, dtype=dtype)
+    else:
+        C0 = C0 / C0.sum()
+
+    # softmax(log(C0)) == C0 (up to additive constant), good init
+    theta0: torch.Tensor = torch.log(C0)
+    theta: torch.nn.Parameter = torch.nn.Parameter(theta0, requires_grad=True)
+
+    optimizer = torch.optim.LBFGS(
+        [theta],
+        lr=lr,
+        max_iter=10,
+        max_eval=25,
+        tolerance_grad=1e-9,
+        tolerance_change=1e-9,
+        history_size=100,
+        line_search_fn="strong_wolfe",
+    )
+
+    # --------------------- targets subset --------------------
+    idx: List[int] = _filter_finite_measured_indices(
+        experimental_fluxes_tensor, measured_flux_indices
+    )
+    flux_subset: torch.Tensor = experimental_fluxes_tensor[idx]
+    m: int = int(len(idx))
+    if m == 0:
+        raise ValueError("All measured targets are NaN/Inf after filtering; cannot optimize.")
+
+    loss_history: List[float] = []
+    grad_dir_history: List[List[float]] = []  # [T, m]
+
+    @torch.no_grad()
+    def eval_loss_only() -> float:
+        C_simplex: torch.Tensor = _theta_to_C(theta)
+        pred: torch.Tensor = _safe_forward(C_simplex)
+        pred_sub: torch.Tensor = pred[idx]
+        loss_mse: torch.Tensor = torch.nn.functional.mse_loss(pred_sub, flux_subset)
+        loss: torch.Tensor = loss_mse + lambda_reg * torch.sum(C_simplex ** 2)
+        return float(loss.detach().cpu().item())
+
+    best_loss: float = eval_loss_only()
+    best_C: torch.Tensor = _theta_to_C(theta).detach().clone()
+
+    # ------------------------ closure ------------------------
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        try:
+            C_simplex: torch.Tensor = _theta_to_C(theta)
+            pred: torch.Tensor = _safe_forward(C_simplex)
+            pred_sub: torch.Tensor = pred[idx]
+            loss_mse: torch.Tensor = torch.nn.functional.mse_loss(pred_sub, flux_subset)
+            loss: torch.Tensor = loss_mse + lambda_reg * torch.sum(C_simplex ** 2)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("loss is non-finite")
+            loss.backward()
+            return loss
+        except Exception:
+            # Always-finite penalty in theta-space so LBFGS can step away
+            theta_safe: torch.Tensor = torch.nan_to_num(theta, nan=0.0, posinf=0.0, neginf=0.0)
+            penalty: torch.Tensor = 1.0 + 1e-6 * torch.sum(theta_safe ** 2)
+            penalty.backward()
+            return penalty
+
+    # ------------------------ optimize -----------------------
+    for _ in range(num_epochs):
+        # ---- per-dimension gradient contributions in C-space (diagnostic) ----
+        optimizer.zero_grad(set_to_none=True)
+        C_diag: torch.Tensor = _theta_to_C(theta)
+
+        try:
+            pred_diag: torch.Tensor = _safe_forward(C_diag)
+            pred_sub_diag: torch.Tensor = pred_diag[idx]
+            residual: torch.Tensor = pred_sub_diag - flux_subset  # [m]
+
+            per_dim_norms: List[float] = []
+            for i in range(m):
+                unit: torch.Tensor = torch.zeros_like(pred_sub_diag)
+                unit[i] = 1.0
+
+                Ji: torch.Tensor = torch.autograd.grad(
+                    outputs=pred_sub_diag,
+                    inputs=C_diag,
+                    grad_outputs=unit,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]  # [k]
+
+                gi: torch.Tensor = (2.0 / float(m)) * residual[i] * Ji
+                per_dim_norms.append(float(gi.norm().detach().cpu().item()))
+
+            grad_dir_history.append(per_dim_norms)
+        except Exception:
+            grad_dir_history.append([float("nan")] * m)
+        # ---------------------------------------------------------------------
+
+        optimizer.step(closure)
+
+        post_step_loss: float = eval_loss_only()
+        loss_history.append(post_step_loss)
+
+        if post_step_loss < best_loss:
+            best_loss = post_step_loss
+            best_C = _theta_to_C(theta).detach().clone()
+
+        grad_norm: float = (
+            float(theta.grad.norm().detach().cpu().item()) if theta.grad is not None else float("nan")
+        )
+        print(f"Loss: {loss_history[-1]:.6e} | ∇θ: {grad_norm:.3e}")
+
+    extras: Dict[str, Any] = {
+        "grad_dir_history": torch.tensor(grad_dir_history, device="cpu"),
+        "best_loss": best_loss,
+    }
+    return loss_history, best_C, extras
+
 
 
 def optimize_C_partial(
@@ -294,22 +532,23 @@ def single_start_partial(
     os.makedirs(run_dir, exist_ok=True)
 
     # === BO initialization function ===
-    def f(C_tensor):
-        C_tensor = C_tensor.detach().clone().requires_grad_(True)
-        loss_history, _, _ = optimize_C_partial_lbfgs(
-            C_tensor,
-            fba_layer,
-            experimental_fluxes_tensor,
-            measured_flux_indices,
-            lr=1,
-            num_epochs=10,
-            lambda_reg=lambda_reg
-        )
-        return torch.tensor([loss_history[-1]])
+    def f(C_tensor: torch.Tensor) -> torch.Tensor:
+        try:
+            C_tensor = C_tensor.detach().to(dtype=torch.float32, device="cpu").clone().requires_grad_(True)
+            loss_history, _, _ = optimize_C_partial_lbfgs(
+                C_tensor, fba_layer, experimental_fluxes_tensor, measured_flux_indices,
+                lr=1.0, num_epochs=10, lambda_reg=lambda_reg
+            )
+            y: float = float(loss_history[-1])
+            if not np.isfinite(y):
+                y = 1e30
+            return torch.tensor([y], dtype=torch.float32)
+        except Exception:
+            return torch.tensor([1e30], dtype=torch.float32)
 
-    dim = len(measured_flux_indices)
-    lower_bound = torch.zeros(dim)
-    upper_bound = torch.ones(dim)
+    dim: int = len(measured_flux_indices)
+    lower_bound: torch.Tensor = torch.zeros(dim, dtype=torch.float32, device="cpu")
+    upper_bound: torch.Tensor = torch.ones(dim, dtype=torch.float32, device="cpu")
 
     best_candidate = bayesian_optimization(
         f=f,
@@ -321,6 +560,10 @@ def single_start_partial(
 
     # === Final training ===
     C = best_candidate.clone().detach().requires_grad_(True)
+
+    # # randomly start C between 0 and 1
+    # dim = len(measured_flux_indices)
+    # C = torch.rand(dim, dtype=torch.float32, requires_grad=True)
 
     loss_history, final_C, extras = optimize_C_partial_lbfgs(
         C,
@@ -334,7 +577,7 @@ def single_start_partial(
 
     final_loss: float = float(loss_history[-1])
 
-    measured_labels = [f"flux_{i}" for i in range(len(measured_flux_indices))]  # or your real names
+    measured_labels = [f"flux_{i}" for i in range(len(measured_flux_indices))]  # or real names
 
     # Compute predictions once
     predicted_fluxes, = fba_layer(final_C.detach())
@@ -343,7 +586,7 @@ def single_start_partial(
 
     # Save plots/files per run
     plot_grad_per_dimension(extras["grad_dir_history"], mode, [f"flux_{i}" for i in range(len(measured_flux_indices))], run_dir, logy=True)
-    plot_summary(final_C.detach(), predicted_subset, experimental_subset, mode, run_dir, measured_labels)
+    #plot_summary(final_C.detach(), predicted_subset, experimental_subset, mode, run_dir, measured_labels)
     save_flux_and_coefficients(final_C.detach(), predicted_subset, experimental_subset, mode, run_dir)
     plot_loss_history(loss_history, mode, run_dir)
 
@@ -408,9 +651,16 @@ def setup_optimization_with_basis_functions_partial(
     C_param = cp.Parameter(len(measured_flux_indices))
     v_measured = cp.hstack([v[i] for i in measured_flux_indices])
 
-    objective_fitness = cp.multiply(C_param, v_measured)
-
     epsilon: float = 1e-6
+
+
+    # 1. Biological Score (approx magnitude: 1.0 - 10.0)
+    objective_fitness = cp.multiply(C_param, v_measured)
+    total_fitness = cp.sum(objective_fitness) + 1e-6  # Avoid div/0
+
+    # 2. Smoothing Penalty (approx magnitude: 0.01 - 0.1)
+    smoothing_term = epsilon * cp.sum_squares(v)
+
     if mode == "norm":
         objective_expr = cp.norm(objective_fitness) + epsilon
     elif mode == "sum_squares":
@@ -422,19 +672,24 @@ def setup_optimization_with_basis_functions_partial(
     elif mode == "inverse_log":
         objective_expr = cp.log(cp.sum(objective_fitness) + epsilon)
     elif mode == "inv_linear":
-        objective_expr = -1.0 / (cp.sum(objective_fitness) + epsilon)
+        objective_expr = -1.0 / total_fitness - smoothing_term
     elif mode == "entropy":
         objective_expr = -cp.sum(cp.entr(objective_fitness + epsilon))  # concave → OK
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
+    #flux_penalty = cp.norm2(v_measured)
+    #penalty_weight = 0 #1e-2
+    #objective_expr -= penalty_weight * flux_penalty
 
     v_min_np = v_min.detach().numpy()
     v_max_np = v_max.detach().numpy()
+    eps = 0.01  # NOTE: Relaxation of steady-state condition seems to help
 
     constraints = [
         #S @ v == 0,
-        S @ v <= 0.001, # NOTE: Relaxation of steady-state condition seems to help
+        S @ v <= eps,
+        -S @ v <= eps,
         v >= v_min_np,
         v <= v_max_np
     ]
@@ -446,60 +701,62 @@ def setup_optimization_with_basis_functions_partial(
 
     base_layer = CvxpyLayer(problem, parameters=[C_param], variables=[v])
 
-    # Pretty-print the problem
-    print("Objective:")
-    print(problem.objective)
-    print("\nConstraints:")
-    for c in problem.constraints:
-        print(c)
-
     return base_layer
 
 
-def extract_bounds(flux_df, model, condition):
-    # Skip enzyme row, keep flux data
-    flux_df = flux_df.iloc[1:].copy()
 
-    # Set the 'Reaction' column as the row index (to access early_LB etc.)
-    flux_df.set_index("Reaction", inplace=True)
-    flux_df.index = flux_df.index.astype(str).str.strip()  # Clean index
+def extract_bounds(
+    flux_df: pd.DataFrame,
+    model: Model,
+    condition: str,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """
+    Returns:
+      lb_row: float Series aligned to model.reactions (index = rxn.id)
+      ub_row: float Series aligned to model.reactions (index = rxn.id)
+      median_row: float Series aligned to model.reactions, with NaNs filled by 0.0 (numeric v_exp)
+      median_measured_mask: bool Series aligned to model.reactions, True where median was present in file
+    """
+    df: pd.DataFrame = flux_df.iloc[1:].copy()
+    df.set_index("Reaction", inplace=True)
+    df.index = df.index.astype(str).str.strip()
 
-    lb_key = f"{condition}_LB"
-    ub_key = f"{condition}_UB"
-    median_key = f"{condition}_MEDIAN"
+    lb_key: str = f"{condition}_LB"
+    ub_key: str = f"{condition}_UB"
+    med_key: str = f"{condition}_MEDIAN"
 
-    lb_row = flux_df.loc[lb_key] if lb_key in flux_df.index else None
-    ub_row = flux_df.loc[ub_key] if ub_key in flux_df.index else None
-    median_row = flux_df.loc[median_key] if median_key in flux_df.index else None
+    lb_raw = df.loc[lb_key] if lb_key in df.index else None
+    ub_raw = df.loc[ub_key] if ub_key in df.index else None
+    med_raw = df.loc[med_key] if med_key in df.index else None
 
-    print("✅ Keys found:", lb_key in flux_df.index, ub_key in flux_df.index, median_key in flux_df.index)
+    cobra_rxns: list[str] = [rxn.id for rxn in model.reactions]
 
-    if lb_row is None or ub_row is None:
-        print(f"⚠️ Missing LB/UB for {condition}. Using defaults!")
-        lb_row = pd.Series({rxn.id: (-1000 if rxn.reversibility else 0) for rxn in model.reactions})
-        ub_row = pd.Series({rxn.id: 1000 for rxn in model.reactions})
+    # --- LB/UB: keep defaults ---
+    if lb_raw is None or ub_raw is None:
+        lb_row = pd.Series(
+            {rxn.id: (-1000.0 if rxn.reversibility else 0.0) for rxn in model.reactions},
+            dtype=float,
+        )
+        ub_row = pd.Series({rxn.id: 1000.0 for rxn in model.reactions}, dtype=float)
     else:
-        lb_row = lb_row.fillna(-1000)
-        ub_row = ub_row.fillna(1000)
+        lb_row = lb_raw.astype(float).fillna(-1000.0)
+        ub_row = ub_raw.astype(float).fillna(1000.0)
 
-    if median_row is None:
-        print(f"⚠️ Missing MEDIAN for {condition}. Using 0's.")
-        median_row = pd.Series({rxn.id: 0 for rxn in model.reactions})
+    lb_row = lb_row.reindex(cobra_rxns, fill_value=-1000.0).astype(float)
+    ub_row = ub_row.reindex(cobra_rxns, fill_value=1000.0).astype(float)
+
+    # --- MEDIAN: preserve NaNs to define "measured" ---
+    if med_raw is None:
+        med_aligned = pd.Series(index=cobra_rxns, data=pd.NA, dtype="float64")
     else:
-        median_row = median_row.fillna(0)
+        med_aligned = med_raw.astype(float).reindex(cobra_rxns)  # keep NaNs
 
-    # Convert to float
-    lb_row = lb_row.astype(float)
-    ub_row = ub_row.astype(float)
-    median_row = median_row.astype(float)
+    median_measured_mask: pd.Series = med_aligned.notna().astype(bool)
+    median_row: pd.Series = med_aligned.fillna(0.0).astype(float)  # numeric v_exp
 
-    # Align with model reactions
-    cobra_rxns = [rxn.id for rxn in model.reactions]
-    lb_row = lb_row.reindex(cobra_rxns, fill_value=-1000)
-    ub_row = ub_row.reindex(cobra_rxns, fill_value=1000)
-    median_row = median_row.reindex(cobra_rxns, fill_value=0)
+    return lb_row, ub_row, median_row, median_measured_mask
 
-    return lb_row, ub_row, median_row
+
 
 
 def load_model(model_path):
@@ -549,7 +806,7 @@ def initialize_S_and_vs(
             if metabolite in reaction.metabolites:
                 S[i, j] = reaction.metabolites[metabolite]
 
-    # === Use your extracted bounds ===
+    # === Use extracted bounds ===
     cobra_rxns = [rxn.id for rxn in model.reactions]
     v_min = [lb_row[rxn_id] for rxn_id in cobra_rxns]
     v_max = [ub_row[rxn_id] for rxn_id in cobra_rxns]
@@ -560,6 +817,34 @@ def initialize_S_and_vs(
     v_max_torch = torch.tensor(v_max, dtype=torch.float32)
 
     return S, v_min, v_max, S_torch, v_min_torch, v_max_torch
+
+
+def enforce_non_producer_zero_flux(
+    model: Model,
+    lb: pd.Series,
+    ub: pd.Series,
+    condition: str,
+    non_producer_conditions: Set[str],
+    product_reactions: List[str],
+) -> Tuple[Model, pd.Series, pd.Series]:
+    """
+    For non-producer conditions, sets product fluxes to 0 in both model and bounds.
+    """
+    if condition not in non_producer_conditions:
+        return model, lb, ub
+
+    for rxn_id in product_reactions:
+        if rxn_id not in lb.index:
+            continue
+        # update model
+        rxn = model.reactions.get_by_id(rxn_id)
+        rxn.lower_bound = 0.0
+        rxn.upper_bound = 0.0
+        # update vectors
+        lb.at[rxn_id] = 0.0
+        ub.at[rxn_id] = 0.0
+
+    return model, lb, ub
 
 
 def select_best_lambda_given_C(
@@ -599,6 +884,7 @@ if '__main__' == __name__:
     parser = argparse.ArgumentParser(description="Starting inverse FBA.")
     parser.add_argument("--condition", type=str,  help="Path to the input Excel file.")
     parser.add_argument("--output_dir", type=str,  help="Path to the input Excel file.")
+    parser.add_argument("--fluxes_mode", type=str,  help="Fluxes in objective function.")
     args = parser.parse_args()
 
 
@@ -607,26 +893,62 @@ if '__main__' == __name__:
     condition = args.condition #'early' # stat, AWZ11expo, AWZ11stat
     arg_output_dir = args.output_dir
 
-    if condition in ['AWZ11expo', 'AWZ11stat']:
-        model = load_model('inputs/CHOmpact_cobrapy_original_nonprod.json')
-        objective_fluxes = ['F142', 'F105', 'F107', 'F112', 'F114']    #growth mab glc lac asn gln
-    elif condition in ['early', 'stat']:
-        model = load_model('inputs/CHOmpact_cobrapy_original.json')
-        objective_fluxes = ['F142', 'F143', 'F105', 'F107', 'F112', 'F114']    #growth mab glc lac asn gln
-    else:
-        raise ValueError(f"Unknown condition: {condition}. Expected one of ['early', 'late', 'AWZ11expo', 'AWZ11stat'].")
+    MODEL_PATH: str = "inputs/CHOmpact_cobrapy_original.json"
+    NON_PRODUCER_CONDITIONS: Set[str] = {"AWZ11expo", "AWZ11stat"}
+    PRODUCT_REACTIONS: List[str] = ["F143"]
 
-    lb_row, ub_row, median_row = extract_bounds(c13, model, condition)
+    STANDARD_OBJECTIVES: Dict[str, List[str]] = {
+        "AWZ11expo": ["F142", "F105", "F107", "F112", "F114"],
+        "AWZ11stat": ["F142", "F105", "F107", "F112", "F114"],
+        "early": ["F142", "F143", "F105", "F107", "F112", "F114"],
+        "stat": ["F142", "F143", "F105", "F107", "F112", "F114"],
+    }
+
+    EXTRACELLULAR_OBJ: Dict[str, List[str]] = {
+        "AWZ11expo": ['F110','F111','F112','F113','F142','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+        "AWZ11stat": ['F110','F111','F112','F113','F142','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+        "early": ['F110','F143','F111','F112','F113','F142','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+        "stat": ['F110','F143','F111','F112','F113','F142','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+    }
+
+    MEASURED_OBJ: Dict[str, List[str]] = {
+        "AWZ11expo": ['F2','F3','F4','F5','F6','F1','F25','F27','F7','F8','F13','F14','F15','F9','F11','F10','F17','F16','F32','F52','F51','F34','F48','F54','F38','F40','F40','F23','F26','F44','F45','F49','F41','F39','F31','F57','F55','F110','F111','F112','F113','F142','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+        "AWZ11stat": ['F2','F3','F4','F5','F6','F1','F25','F27','F7','F8','F13','F14','F15','F9','F11','F10','F17','F16','F32','F52','F51','F34','F48','F54','F38','F40','F40','F23','F26','F44','F45','F49','F41','F39','F31','F57','F55','F110','F111','F112','F113','F142','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+        "early": ['F2','F3','F4','F5','F6','F1','F25','F27','F7','F8','F13','F14','F15','F9','F11','F10','F17','F16','F32','F52','F51','F34','F48','F54','F38','F40','F40','F23','F26','F44','F45','F49','F41','F39','F31','F57','F55','F110','F111','F112','F113','F142','F143','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+        "stat": ['F2','F3','F4','F5','F6','F1','F25','F27','F7','F8','F13','F14','F15','F9','F11','F10','F17','F16','F32','F52','F51','F34','F48','F54','F38','F40','F40','F23','F26','F44','F45','F49','F41','F39','F31','F57','F55','F110','F111','F112','F113','F142','F143','F105','F114','F115','F116','F117','F118','F107','F119','F120','F121','F122','F123','F124','F125','F126','F127','F128'],
+    }
+
+
+    model: Model = load_model(MODEL_PATH)
+
+    if args.fluxes_mode == "all":
+        objective_fluxes: List[str] = [f"F{i}" for i in range(1, 145)]
+    elif args.fluxes_mode == "standard":
+        objective_fluxes = STANDARD_OBJECTIVES[condition]
+    elif args.fluxes_mode == "extracellular":
+        objective_fluxes = EXTRACELLULAR_OBJ[condition]
+    elif args.fluxes_mode == "measured":
+        objective_fluxes = MEASURED_OBJ[condition]
+    else:
+        raise ValueError(f"Unknown fluxes mode: {args.fluxes_mode}")
+
+    lb_row, ub_row, median_row, median_measured_mask = extract_bounds(c13, model, condition)
+    flux_to_index = {rxn.id: i for i, rxn in enumerate(model.reactions)}
+
+    measured_flux_indices: list[int] = [
+        flux_to_index[rxn_id]
+        for rxn_id, is_measured in median_measured_mask.items()
+        if bool(is_measured)
+    ]
+
+    model, lb_row, ub_row = enforce_non_producer_zero_flux(model,lb_row,ub_row,condition,NON_PRODUCER_CONDITIONS,PRODUCT_REACTIONS)
     constrained_model = constrain_model(model, lb_row, ub_row, median_row)
     median_tensor = torch.tensor(median_row.values, dtype=torch.float32)
     output_dir_input = os.path.join(arg_output_dir,condition)
 
     num_reactions = len(model.reactions)
 
-    S, vmin, vmax, S_torch, v_min_torch, v_max_torch = initialize_S_and_vs(
-        model, lb_row, ub_row
-    )
-    flux_to_index = {rxn.id: i for i, rxn in enumerate(model.reactions)}
+    S, vmin, vmax, S_torch, v_min_torch, v_max_torch = initialize_S_and_vs(model, lb_row, ub_row)
 
     objective_fluxes_indices = [flux_to_index[name] for name in objective_fluxes]
     lambda_grid = [1e-6, 1e-5, 1e-4]
@@ -636,8 +958,7 @@ if '__main__' == __name__:
         os.makedirs(output_dir, exist_ok=True)
 
         fba_layer = setup_optimization_with_basis_functions_partial(
-            objective_fluxes_indices, S, v_min_torch, v_max_torch, num_reactions, mode
-        )
+            objective_fluxes_indices, S, v_min_torch, v_max_torch, num_reactions, mode)
         # === Step 5.1: Random C for lambda tuning ===
         C_random = torch.rand(len(objective_fluxes_indices), dtype=torch.float32)
 
@@ -671,8 +992,12 @@ if '__main__' == __name__:
         best_output_dir = os.path.join(output_dir, "final")
         os.makedirs(best_output_dir, exist_ok=True)
 
-        plot_summary(best_C, predicted_subset, true_subset, mode, best_output_dir, objective_fluxes)
         save_flux_and_coefficients(best_C, predicted_subset, true_subset, mode, best_output_dir)
+        # if args.fluxes_mode == "all":
+        #     print("No plotting")
+        # else:
+        #     plot_summary(best_C, predicted_subset, true_subset, mode, best_output_dir, objective_fluxes)
+
 
 
 

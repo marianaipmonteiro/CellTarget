@@ -1,6 +1,6 @@
 # CellTarget
 
-CellTarget is a computational framework for inferring cellular objective functions from experimental flux data using convex optimisation under partial observability.  
+CellTarget is a computational framework for inferring cellular objective functions from experimental flux data using convex optimisation under partial observability. This work has been published in NPJ Systems Biology & Applications: https://www.nature.com/articles/s41540-026-00700-8 
 The framework is applicable to both reduced metabolic models and genome-scale models.
 
 
